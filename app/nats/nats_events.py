@@ -1,88 +1,73 @@
-import asyncio
-import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
-
-from app.db.db import get_db
-from app.models.github_repo import GitHubRepo
-from app.models.github_event import GitHubCommit, GitHubIssue, GitHubRelease
-from nats.aio.client import Client as NATS
 import os
+import httpx
+import asyncio
+import json
+from app.models.github_repo import GitHubRepo
+from app.ws.connection_manager import GitHubWSManager
+from app.nats.nats_client import nats_client  # твой NATS клиент
+from sqlalchemy.ext.asyncio import AsyncSession
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-NATS_URL = os.getenv("NATS_URL", "nats://localhost:4222")
-
+github_ws_manager = GitHubWSManager()
 
 
 async def fetch_github_data(db: AsyncSession):
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json"
-    }
+    if not GITHUB_TOKEN:
+        raise RuntimeError("GITHUB_TOKEN not found")
+
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
     async with httpx.AsyncClient() as client:
-        # Получаем все репозитории из БД
-        result = await db.execute(select(GitHubRepo))
-        repos = result.scalars().all()
+        resp = await client.get("https://api.github.com/user/repos", headers=headers)
+        if resp.status_code != 200:
+            print("Error fetching GitHub data:", resp.json())
+            return
+        repos = resp.json()
 
-        for repo in repos:
-            full_name = f"{repo.owner}/{repo.name}"
+    for repo_data in repos:
+        repo = await db.get(GitHubRepo, repo_data["id"])
+        if not repo:
+            repo = GitHubRepo(
+                id=repo_data["id"],
+                owner=repo_data["owner"]["login"],
+                name=repo_data["name"],
+                url=repo_data["html_url"],
+                private=repo_data.get("private", False)
+            )
+            db.add(repo)
+            await db.commit()
+            await db.refresh(repo)
+            event = {"event": "repo_created", "repo": repo.dict()}
+        else:
+            # Обновление существующего репозитория
+            repo.name = repo_data["name"]
+            repo.private = repo_data.get("private", False)
+            db.add(repo)
+            await db.commit()
+            await db.refresh(repo)
+            event = {"event": "repo_updated", "repo": repo.dict()}
 
-            # ----------------------------
-            # Получаем последние коммиты
-            # ----------------------------
-            commits_resp = await client.get(f"https://api.github.com/repos/{full_name}/commits", headers=headers)
-            if commits_resp.status_code == 200:
-                commits = commits_resp.json()
-                for c in commits:
-                    commit = GitHubCommit(
-                        repo=full_name,
-                        sha=c["sha"],
-                        message=c["commit"]["message"],
-                        url=c["html_url"]
-                    )
-                    db.add(commit)
+        # Отправляем в WebSocket (строка JSON)
+        await github_ws_manager.broadcast(json.dumps(event))
 
-            # ----------------------------
-            # Получаем открытые issues
-            # ----------------------------
-            issues_resp = await client.get(f"https://api.github.com/repos/{full_name}/issues", headers=headers, params={"state": "open"})
-            if issues_resp.status_code == 200:
-                issues = issues_resp.json()
-                for i in issues:
-                    if "pull_request" not in i:  # исключаем PR
-                        issue = GitHubIssue(
-                            repo=full_name,
-                            issue_number=i["number"],
-                            title=i["title"],
-                            state=i["state"],
-                            url=i["html_url"]
-                        )
-                        db.add(issue)
+        # Публикуем в NATS (байты)
+        await nats_client.publish("repos.updates", json.dumps(event).encode())
 
-            # ----------------------------
-            # Получаем последние релизы
-            # ----------------------------
-            releases_resp = await client.get(f"https://api.github.com/repos/{full_name}/releases", headers=headers)
-            if releases_resp.status_code == 200:
-                releases = releases_resp.json()
-                for r in releases:
-                    release = GitHubRelease(
-                        repo=full_name,
-                        tag_name=r["tag_name"],
-                        name=r.get("name"),
-                        url=r["html_url"]
-                    )
-                    db.add(release)
 
-        # Сохраняем все изменения
-        await db.commit()
+async def publish_event(subject: str, message: dict):
+    """
+    Публикация события в NATS
+    """
+    await nats_client.publish(subject, json.dumps(message).encode())
 
-        # ----------------------------
-        # Публикуем событие в NATS
-        # ----------------------------
-        nc = NATS()
-        await nc.connect(NATS_URL)
-        await nc.publish("github.updates", b"GitHub data synced")
-        await nc.flush()
-        await nc.close()
+
+async def periodic_sync_task(db: AsyncSession, interval: int = 60):
+    """
+    Периодическая синхронизация GitHub каждые `interval` секунд.
+    """
+    while True:
+        try:
+            await fetch_github_data(db)
+        except Exception as e:
+            print(f"Error in GitHub periodic task: {e}")
+        await asyncio.sleep(interval)
