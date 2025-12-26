@@ -1,16 +1,17 @@
 import asyncio
+
+import httpx
 from fastapi import FastAPI
 from app.api import github
 from app.db.db import engine, SQLModel, async_session
 from fastapi.middleware.cors import CORSMiddleware
+from app.nats.nats_events import nats_subscribe_task
 from app.nats import nats_events
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-
-
 
 app = FastAPI(title="GitHub Monitor API", version="1.0")
 
@@ -27,25 +28,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(github.router, prefix="/github", tags=["GitHub"])
+app.include_router(github.router, tags=["GitHub"])
 
 
 @app.on_event("startup")
 async def on_startup():
-    # Создаем таблицы в базе
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
-    # Запуск фоновой задачи GitHub
-    asyncio.create_task(start_periodic_sync())
-
-
-async def start_periodic_sync():
-    """
-    Фоновая задача для периодической синхронизации GitHub каждые N секунд.
-    """
-    # Указываем интервал в секундах (например, каждые 60 секунд)
-    interval = 60
-
-    async with async_session() as session:
-        await nats_events.periodic_sync_task(session, interval)
+    asyncio.create_task(nats_events.periodic_sync_task(interval=60))
+    asyncio.create_task(nats_subscribe_task())

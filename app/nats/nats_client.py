@@ -12,7 +12,6 @@ nats_client = NATS()
 
 
 async def connect_nats():
-    """Подключение к NATS серверу"""
     try:
         await nats_client.connect(servers=[NATS_URL])
         print("Connected to NATS server")
@@ -21,12 +20,10 @@ async def connect_nats():
 
 
 async def publish(subject: str, message: dict):
-    """Публикация сообщений в NATS"""
     await nats_client.publish(subject, str(message).encode())
 
 
 async def subscribe(subject: str, callback):
-    """Подписка на канал"""
 
     async def message_handler(msg):
         data = msg.data.decode()
@@ -34,6 +31,4 @@ async def subscribe(subject: str, callback):
 
     await nats_client.subscribe(subject, cb=message_handler)
 
-
-# Автоподключение при импорте модуля (необязательно, можно запускать отдельно)
 asyncio.create_task(connect_nats())

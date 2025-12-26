@@ -4,7 +4,8 @@ from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisco
 from sqlmodel import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.db import get_db
-from app.models.github_repo import GitHubRepo, GitHubRepoUpdate, GitHubRepoCreate
+from app.models.github_repo import GitHubRepo, GitHubRepoUpdate, GitHubRepoCreate, ParsedGitHubRepo
+from app.services.parser import get_repos
 from app.ws.connection_manager import GitHubWSManager
 from app.nats import nats_events
 
@@ -13,8 +14,20 @@ github_ws_manager = GitHubWSManager()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 HEADERS = {
     "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json"
+    "User-Agent": "FastAPI-GitHub-Monitor"
 }
+
+@router.get("/parsedrepos", response_model=list[ParsedGitHubRepo])
+async def get_repos_endpoint(owner: str, db: AsyncSession = Depends(get_db)):
+    repos = await get_repos(owner)
+
+    for repo in repos:
+        db.add(ParsedGitHubRepo(**repo))
+    await db.commit()
+
+    stmt = select(ParsedGitHubRepo)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 @router.get("/repos", response_model=list[GitHubRepo])
 async def list_repos(db: AsyncSession = Depends(get_db)):
@@ -51,7 +64,6 @@ async def create_repo(name: str, private: bool = True, db: AsyncSession = Depend
     await db.commit()
     await db.refresh(repo)
 
-    # WebSocket уведомление
     await github_ws_manager.broadcast({"event": "repo_created", "repo": repo.dict()})
 
     return repo
@@ -75,7 +87,6 @@ async def update_repo(repo_id: int, patch: GitHubRepoUpdate, db: AsyncSession = 
             if response.status_code not in (200, 201):
                 raise HTTPException(status_code=response.status_code, detail=response.json())
 
-        # Обновляем локально
         for k, v in patch.dict(exclude_unset=True).items():
             setattr(repo, k, v)
         db.add(repo)
@@ -99,7 +110,6 @@ async def delete_repo(repo_id: int, db: AsyncSession = Depends(get_db)):
         if response.status_code not in (204, 200):
             raise HTTPException(status_code=response.status_code, detail=response.json())
 
-    # Удаляем локально
     await db.delete(repo)
     await db.commit()
 

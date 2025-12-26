@@ -15,3 +15,10 @@ class GitHubRepoUpdate(SQLModel):
 class GitHubRepoCreate(SQLModel):
     name: str
     private: bool = True
+
+class ParsedGitHubRepo(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    owner: str
+    name: str
+    url: str
+    private: bool = False

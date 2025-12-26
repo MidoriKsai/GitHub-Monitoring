@@ -1,23 +1,62 @@
-import asyncio
+import os
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.nats.nats_events import publish_event
-from app.ws.connection_manager import ItemWSManager
+import json
 from app.models.github_repo import GitHubRepo
+from app.nats.nats_publish import publish_event
+from app.ws.connection_manager import GitHubWSManager
 
-ws_manager: ItemWSManager = ItemWSManager()
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"}
+github_ws_manager = GitHubWSManager()
+
+async def fetch_github_data(session):
+    if not GITHUB_TOKEN:
+        raise RuntimeError("GITHUB_TOKEN not found")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get("https://api.github.com/user/repos", headers=HEADERS)
+
+    if resp.status_code != 200:
+        print("GitHub fetch error:", resp.text)
+        return
+
+    repos = resp.json()
+    for repo_data in repos:
+        repo = await session.get(GitHubRepo, repo_data["id"])
+        event_type = ""
+
+        if not repo:
+            repo = GitHubRepo(
+                id=repo_data["id"],
+                owner=repo_data["owner"]["login"],
+                name=repo_data["name"],
+                url=repo_data["html_url"],
+                private=repo_data.get("private", False)
+            )
+            session.add(repo)
+            await session.commit()
+            event_type = "repo_created"
+        else:
+            changed = False
+            for field in ["name", "private", "url"]:
+                value = repo_data.get(field)
+                if value is not None and getattr(repo, field) != value:
+                    setattr(repo, field, value)
+                    changed = True
+            if changed:
+                session.add(repo)
+                await session.commit()
+                event_type = "repo_updated"
+
+        if event_type:
+            await broadcast_event(event_type, repo.dict())
 
 
-async def fetch_github_data_periodically(db: AsyncSession, interval: int = 300):
-    while True:
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get("https://github.com/explore")
-                data = {"event": "github_data", "payload": "some data from github explore"}
+async def broadcast_event(event: str, payload: dict):
+    message = {"event": event, "payload": payload}
 
-                await ws_manager.broadcast(data)
+    # WS
+    await github_ws_manager.broadcast(json.dumps(message))
 
-                await publish_event("items.updates", data)
-        except Exception as e:
-            print("Error in GitHub periodic task:", e)
-        await asyncio.sleep(interval)
+    # NATS
+    await publish_event("repos.updates", event, payload)
